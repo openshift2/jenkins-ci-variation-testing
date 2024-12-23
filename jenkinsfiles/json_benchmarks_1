@@ -1,0 +1,308 @@
+pipeline {
+
+    agent {
+        node {
+            label 'khjson1'
+        }
+    }
+
+    // agent {
+    //     docker {
+    //       image 'cppalliance/boost_superproject_build:24.04-v3'
+    //       // label 'jenkinspool1'
+    //       }
+    // }
+
+    stages {
+        stage('Preclean Workspace') {
+            steps {
+                sh """#!/bin/bash
+                set -xe
+                rm -rf * .*
+                """
+                // checkout scm
+                checkout([
+                           $class: 'GitSCM',
+                           branches: scm.branches,
+                           doGenerateSubmoduleConfigurations: scm.doGenerateSubmoduleConfigurations,
+                           extensions: scm.extensions,
+                           submoduleCfg: [],
+                           userRemoteConfigs: [[credentialsId: scm.userRemoteConfigs[0].credentialsId, url: scm.userRemoteConfigs[0].url, refspec: scm.userRemoteConfigs[0].refspec + ' +refs/heads/*:refs/remotes/origin/*' ]]
+                       ])
+
+                checkout([
+                           $class: 'GitSCM',
+                           branches: [[name: 'refs/heads/master']],
+                           doGenerateSubmoduleConfigurations: false,
+                           extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'Infrastructure-Docs']],
+                           submoduleCfg: [],
+                           userRemoteConfigs: [[credentialsId: 'github-cppalliance-bot', url: 'https://github.com/cppalliance/Infrastructure-Docs']]
+                       ])
+            }
+        }
+
+        stage('Set Variables') {
+            steps {
+                sh '''#!/bin/bash -xe
+                echo "" > jenkinsjobinfo.sh
+                chmod 777 jenkinsjobinfo.sh
+                REPONAME=$(basename -s .git "$(git config --get remote.origin.url)")
+                # REPONAME=$(basename `git rev-parse --show-toplevel`)
+                DNSREPONAME=$(echo $REPONAME | tr '_' '-')
+                ORGANIZATION=$(basename $(dirname "${GIT_URL}"))
+                if [[ "${GIT_URL}" =~ sdarwin ]]; then
+                    # testing environment
+                    echo "export JENKINS_CI_REPO=sdarwin/jenkins-ci" >> jenkinsjobinfo.sh
+                    echo "export JENKINS_CI_REPO_BRANCH=testing" >> jenkinsjobinfo.sh
+                else
+                    # standard
+                    echo "export JENKINS_CI_REPO=cppalliance/jenkins-ci" >> jenkinsjobinfo.sh
+                    echo "export JENKINS_CI_REPO_BRANCH=master" >> jenkinsjobinfo.sh
+                fi
+                echo "export REPONAME=${REPONAME}" >> jenkinsjobinfo.sh
+                echo "export DNSREPONAME=${DNSREPONAME}" >> jenkinsjobinfo.sh
+                echo "export ORGANIZATION=${ORGANIZATION}" >> jenkinsjobinfo.sh
+                '''
+            }
+        }
+
+        stage('Diagnostics') {
+            steps {
+                sh '''#!/bin/bash
+                set -x
+                # not set -e. errors may occur in diagnostics
+                cat jenkinsjobinfo.sh
+                . jenkinsjobinfo.sh
+                ls -al
+                cat /etc/os-release
+                pwd
+                env
+                whoami
+                touch $(date "+%A-%B-%d-%T-%y")
+                mount | grep ^/dev/ | grep -v /etc | awk '{print \$3}'
+                git branch
+                git branch -avv
+                true
+                '''
+            }
+        }
+
+        stage('Prebuild script') {
+            when {
+                anyOf{
+                    branch 'develop'
+                    branch 'master'
+                    expression { env.CHANGE_ID != null }
+                }
+           }
+            steps {
+                sh '''#!/bin/bash
+                set -xe
+                . jenkinsjobinfo.sh
+                curl -f -o jenkins_prebuild_script.sh https://raw.githubusercontent.com/${JENKINS_CI_REPO}/${JENKINS_CI_REPO_BRANCH}/scripts/${ORGANIZATION}_${REPONAME}_benchmarks_prebuild.sh || true
+                if [ -f jenkins_prebuild_script.sh ]; then
+                    chmod 755 jenkins_prebuild_script.sh
+                    ./jenkins_prebuild_script.sh
+                fi
+                '''
+            }
+         }
+
+        // To skip this step, and actually all steps, adjust the job's Filter regex in the Jenkins UI
+        // (develop|master|PR-.*) will build all branches
+        // (PR-.*) will build pull requests. Etc.
+        stage('Run benchmarks') {
+            when {
+                anyOf{
+                    expression { env.CHANGE_ID != null }
+                }
+            }
+
+            steps {
+                sh '''#!/bin/bash
+                set -xe
+                . jenkinsjobinfo.sh
+                export pythonvirtenvpath=/opt/venvboostdocs
+                if [ -f ${pythonvirtenvpath}/bin/activate ]; then
+                    source ${pythonvirtenvpath}/bin/activate
+                fi
+
+                # Is there a custom build script? Often not. But let's check:
+
+                curl -f -o jenkins_build_script.sh https://raw.githubusercontent.com/${JENKINS_CI_REPO}/${JENKINS_CI_REPO_BRANCH}/scripts/${ORGANIZATION}_${REPONAME}_benchmarks_build.sh || true
+                if [ -f jenkins_build_script.sh ]; then
+                    chmod 755 jenkins_build_script.sh
+                    ./jenkins_build_script.sh
+                    exit 0
+                fi
+
+                # Otherwise, proceed using standard build steps:
+
+                export WORKSPACE_ROOT=$(pwd -P)
+
+                # update json bench submodules
+                cd bench
+                ./clone.sh
+                cd $WORKSPACE_ROOT
+
+                # /opt/github/boost needs to already be present. Manual setup.
+                cd /opt/github/boost
+                export BOOST_ROOT=$(pwd -P)
+                git pull
+                git submodule update --init -f
+
+                # Obsolete comments: this type of section could be used to download boost manually:
+                # if [ ! -d boost-root ]; then
+                #   git clone -b master https://github.com/boostorg/boost.git boost-root
+                # fi
+                # cd boost-root
+                # export BOOST_ROOT=$(pwd -P)
+                # git pull
+                # git submodule update --init --recursive
+
+                rsync -av --delete $WORKSPACE_ROOT/ libs/json > /dev/null 2>&1
+
+                ./bootstrap.sh
+                # ./b2 headers
+                ./b2 toolset=clang variant=release cxxstd=latest headers
+
+                cd $WORKSPACE_ROOT/Infrastructure-Docs/benchmarks/json
+                # heredoc is not disrupting indentation
+cat >config.ini <<EOL
+[section1]
+resultdestinationdir = /var/www/html/jsonbenchmarks-pullrequests/${CHANGE_ID}
+initialcheckoutrepository = false
+jsonhome = "$BOOST_ROOT/libs/json"
+numberofcommitstoparse = 1
+numberofrunstocompare = 1
+printpullrequests = true
+# benchcommand = "sudo cset shield --exec -- nice -n -20 sudo -u nodejenkins ./bench -i:b *.json"
+benchcommand = "sudo cgexec -g memory,cpu:shield sudo -u nodejenkins ./bench -n:6 -i:b *.json"
+rsyncdestinationdir = "/var/www/html/jsonbenchmarks-pullrequests/"
+pinnedcommits = ""
+pullrequest = true
+mergemsvc = false
+EOL
+
+                # printmergedresultspercommit = false
+                # printmergedresultsacrosscommits = false
+                # benchcommand = "./bench -t:s -i:b -n:1 twitter.json"
+                # benchcommand = "./bench -n:1 *.json"
+                # earlier production benchcommand:
+                # benchcommand = "sudo nice -n -20 sudo -u nodejenkins ./bench -i:b *.json"
+
+                # Unfortunately, there seem to be difficulties injecting env variables
+                # into docker containers. Consider changing this later.
+                mkdir -p ~/.ssh
+                chmod 700 ~/.ssh
+                # Place the 'benchmarks' ssh private key in ~/.ssh/benchmarks
+                # Already done on that server. Removing the step from the job since
+                # this file will be hosted in a gh public repository.
+                # echo ___ | base64 -d > ~/.ssh/benchmarks
+                # chmod 600 ~/.ssh/benchmarks
+
+                ./runbenchmarks.py
+
+                '''
+                }
+            }
+
+        stage('Postbuild script') {
+            when {
+                anyOf{
+                    branch 'develop'
+                    branch 'master'
+                    expression { env.CHANGE_ID != null }
+                }
+           }
+            steps {
+                sh '''#!/bin/bash
+                set -xe
+
+                . jenkinsjobinfo.sh
+                curl -f -o jenkins_postbuild_script.sh https://raw.githubusercontent.com/${JENKINS_CI_REPO}/${JENKINS_CI_REPO_BRANCH}/scripts/${ORGANIZATION}_${REPONAME}_benchmarks_postbuild.sh || true
+                if [ -f jenkins_postbuild_script.sh ]; then
+                    chmod 755 jenkins_postbuild_script.sh
+                    ./jenkins_postbuild_script.sh
+                fi
+                '''
+            }
+         }
+
+        stage('Pull requests: comment in PR') {
+            when {
+                anyOf{
+                    expression { env.CHANGE_ID != null }
+                }
+            }
+
+            environment {
+                // See https://www.jenkins.io/doc/book/pipeline/jenkinsfile/#using-environment-variables
+                 PNGNAME = """${sh(
+                 returnStdout: true,
+                 script: '#!/bin/bash \n' + 'source Infrastructure-Docs/benchmarks/json/tmp/pngpropertiesfile; echo -n "${PNGNAME}"'
+             )}"""
+
+            }
+
+            steps {
+
+                script {
+
+                    commenttext = "![pullrequest](https://benchmark.cppalliance.org/jsonbenchmarks-pullrequests/${env.CHANGE_ID}/${env.PNGNAME})\n Benchmark test results. More info at [https://benchmark.cppalliance.org/jsonbenchmarks-pullrequests/${env.CHANGE_ID}/pullrequest.html](https://benchmark.cppalliance.org/jsonbenchmarks-pullrequests/${env.CHANGE_ID}/pullrequest.html)"
+
+                    pullRequest.comment(commenttext)
+
+                }
+            }
+        }
+
+        stage('Post Diagnostics') {
+            steps {
+                sh '''#!/bin/bash
+                set -x
+                # not set -e. errors may occur in diagnostics
+                cat jenkinsjobinfo.sh
+                . jenkinsjobinfo.sh
+                ls -al
+                cat /etc/os-release
+                pwd
+                env
+                whoami
+                touch $(date "+%A-%B-%d-%T-%y")
+                mount | grep ^/dev/ | grep -v /etc | awk '{print \$3}'
+                git branch
+                git branch -avv
+                true
+                '''
+            }
+        }
+
+    }
+
+    post {
+            always {
+                echo 'This will always run'
+            }
+            success {
+                echo 'This will run only if successful'
+                // no email on success
+                // mail bcc: '', body: "<b>Example</b><br>Project: ${env.JOB_NAME} <br>Build Number: ${env.BUILD_NUMBER} <br> URL of the build: ${env.BUILD_URL}", cc: '', charset: 'UTF-8', from: '', mimeType: 'text/html', replyTo: '', subject: "SUCCESS CI: Project name -> ${env.JOB_NAME}", to: "jenkins@cppalliance.org";
+            }
+            failure {
+                echo 'This will run only if failure'
+                mail bcc: '', body: "<b>Example</b><br>Project: ${env.JOB_NAME} <br>Build Number: ${env.BUILD_NUMBER} <br> URL of the build: ${env.BUILD_URL}", cc: '', charset: 'UTF-8', from: '', mimeType: 'text/html', replyTo: '', subject: "ERROR CI: Project name -> ${env.JOB_NAME}", to: "jenkins@cppalliance.org";
+            }
+            unstable {
+                echo 'This will run only if the run was marked as unstable'
+                mail bcc: '', body: "<b>Example</b><br>Project: ${env.JOB_NAME} <br>Build Number: ${env.BUILD_NUMBER} <br> URL of the build: ${env.BUILD_URL}", cc: '', charset: 'UTF-8', from: '', mimeType: 'text/html', replyTo: '', subject: "UNSTABLE STATUS CI: Project name -> ${env.JOB_NAME}", to: "jenkins@cppalliance.org";
+            }
+            changed {
+                echo 'This will run only if the state of the Pipeline has changed'
+                echo 'For example, if the Pipeline was previously failing but is now successful'
+                // no email on changed status
+                // mail bcc: '', body: "<b>Example</b><br>Project: ${env.JOB_NAME} <br>Build Number: ${env.BUILD_NUMBER} <br> URL of the build: ${env.BUILD_URL}", cc: '', charset: 'UTF-8', from: '', mimeType: 'text/html', replyTo: '', subject: "CHANGED STATUS CI: Project name -> ${env.JOB_NAME}", to: "jenkins@cppalliance.org";
+            }
+      }
+
+}

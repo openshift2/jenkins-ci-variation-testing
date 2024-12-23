@@ -1,0 +1,264 @@
+pipeline {
+
+    // agent {
+    //     node {
+    //         label 'jenkinspool1'
+    //     }
+    // }
+
+    agent {
+        docker {
+          // image 'circleci/ruby:2.4-node-browsers-legacy'
+          // image 'cppalliance/boost_superproject_build:24.04-v3'
+          image 'cppalliance/ruby2.4:1'
+          // label 'jenkinspool1'
+          }
+    }
+
+    stages {
+        stage('Preclean Workspace') {
+            steps {
+                sh """#!/bin/bash
+                set -xe
+                # certain OS's can view this as an error:
+                rm -rf * .* || true
+                """
+                checkout scm
+            }
+        }
+
+        stage('Set Variables') {
+            steps {
+                sh '''#!/bin/bash -xe
+                echo "" > jenkinsjobinfo.sh
+                chmod 777 jenkinsjobinfo.sh
+                REPONAME=$(basename -s .git "$(git config --get remote.origin.url)")
+                # REPONAME=$(basename `git rev-parse --show-toplevel`)
+                DNSREPONAME=$(echo $REPONAME | tr '_' '-')
+                ORGANIZATION=$(basename $(dirname "${GIT_URL}"))
+                if [[ "${GIT_URL}" =~ sdarwin || "${GIT_URL}" =~ openshift ]]; then
+                    # testing environment
+                    echo "export JENKINS_CI_REPO=sdarwin/jenkins-ci" >> jenkinsjobinfo.sh
+                    echo "export JENKINS_CI_REPO_BRANCH=testing" >> jenkinsjobinfo.sh
+                else
+                    # standard
+                    echo "export JENKINS_CI_REPO=cppalliance/jenkins-ci" >> jenkinsjobinfo.sh
+                    echo "export JENKINS_CI_REPO_BRANCH=master" >> jenkinsjobinfo.sh
+                fi
+                echo "export PRTEST=prtest" >> jenkinsjobinfo.sh
+                echo "export REPONAME=${REPONAME}" >> jenkinsjobinfo.sh
+                echo "export DNSREPONAME=${DNSREPONAME}" >> jenkinsjobinfo.sh
+                echo "export ORGANIZATION=${ORGANIZATION}" >> jenkinsjobinfo.sh
+                '''
+            }
+        }
+
+        stage('Diagnostics') {
+            steps {
+                sh '''#!/bin/bash
+                set -x
+                # not set -e. errors may occur in diagnostics
+                cat jenkinsjobinfo.sh
+                . jenkinsjobinfo.sh
+                ls -al
+                cat /etc/os-release
+                pwd
+                env
+                whoami
+                touch $(date "+%A-%B-%d-%T-%y")
+                mount | grep ^/dev/ | grep -v /etc | awk '{print \$3}'
+                git branch
+                git branch -avv
+                true
+                '''
+            }
+        }
+
+        stage('Prebuild script') {
+            when {
+                anyOf{
+                    branch 'develop'
+                    branch 'master'
+                    expression { env.CHANGE_ID != null }
+                }
+           }
+            steps {
+                sh '''#!/bin/bash
+                set -xe
+                . jenkinsjobinfo.sh
+                curl -f -o jenkins_prebuild_script.sh https://raw.githubusercontent.com/${JENKINS_CI_REPO}/${JENKINS_CI_REPO_BRANCH}/scripts/${ORGANIZATION}_${REPONAME}_prebuild.sh || true
+                if [ -f jenkins_prebuild_script.sh ]; then
+                    chmod 755 jenkins_prebuild_script.sh
+                    ./jenkins_prebuild_script.sh
+                fi
+                '''
+            }
+         }
+
+        // To skip this step, and actually all steps, adjust the job's Filter regex in the Jenkins UI
+        // (develop|master|PR-.*) will build all branches
+        // (PR-.*) will build pull requests. Etc.
+        stage('Build docs') {
+            when {
+                anyOf{
+                    branch 'develop'
+                    branch 'master'
+                    expression { env.CHANGE_ID != null }
+                }
+            }
+
+            steps {
+                sh '''#!/bin/bash
+                set -xe
+                . jenkinsjobinfo.sh
+                export pythonvirtenvpath=/opt/venvboostdocs
+                if [ -f ${pythonvirtenvpath}/bin/activate ]; then
+                    source ${pythonvirtenvpath}/bin/activate
+                fi
+
+                # Is there a custom build script? Often not. But let's check:
+
+                curl -f -o jenkins_build_script.sh https://raw.githubusercontent.com/${JENKINS_CI_REPO}/${JENKINS_CI_REPO_BRANCH}/scripts/${ORGANIZATION}_${REPONAME}_build.sh || true
+                if [ -f jenkins_build_script.sh ]; then
+                    chmod 755 jenkins_build_script.sh
+                    ./jenkins_build_script.sh
+                    exit 0
+                fi
+
+                # Otherwise, proceed using standard build steps:
+
+                export HOME=$(pwd)
+                sudo bundle install
+                bundle exec jekyll build
+
+                '''
+                }
+            }
+
+        stage('Postbuild script') {
+            when {
+                anyOf{
+                    branch 'develop'
+                    branch 'master'
+                    expression { env.CHANGE_ID != null }
+                }
+           }
+            steps {
+                sh '''#!/bin/bash
+                set -xe
+
+                . jenkinsjobinfo.sh
+                curl -f -o jenkins_postbuild_script.sh https://raw.githubusercontent.com/${JENKINS_CI_REPO}/${JENKINS_CI_REPO_BRANCH}/scripts/${ORGANIZATION}_${REPONAME}_postbuild.sh || true
+                if [ -f jenkins_postbuild_script.sh ]; then
+                    chmod 755 jenkins_postbuild_script.sh
+                    ./jenkins_postbuild_script.sh
+                fi
+                '''
+            }
+         }
+
+        stage('Pull requests: Upload to S3') {
+            when {
+                anyOf{
+                    expression { env.CHANGE_ID != null }
+                }
+            }
+
+            environment {
+                // See https://www.jenkins.io/doc/book/pipeline/jenkinsfile/#using-environment-variables
+                 REPONAME = """${sh(
+                 returnStdout: true,
+                 script: '#!/bin/bash \n' + 'source jenkinsjobinfo.sh; echo -n "${REPONAME}"'
+             )}"""
+                 DNSREPONAME = """${sh(
+                 returnStdout: true,
+                 script: '#!/bin/bash \n' + 'source jenkinsjobinfo.sh; echo -n "${DNSREPONAME}"'
+             )}"""
+                 PRTEST = """${sh(
+                 returnStdout: true,
+                 script: '#!/bin/bash \n' + 'source jenkinsjobinfo.sh; echo -n "${PRTEST}"'
+             )}"""
+
+            }
+
+            steps {
+                withAWS(region:'us-east-1', credentials: 'cppalliance-bot-aws-user') {
+
+                    s3Upload(bucket:"cppalliance-previews", path:"${DNSREPONAME}/${CHANGE_ID}/",  workingDir: "_site" , includePathPattern:"**")
+
+                }
+                script {
+
+                    commenttext = "An automated preview of the documentation is available at [https://${env.CHANGE_ID}.${env.DNSREPONAME}.${env.PRTEST}.cppalliance.org](https://${env.CHANGE_ID}.${env.DNSREPONAME}.${env.PRTEST}.cppalliance.org)"
+
+                    pullRequest.comment(commenttext)
+
+                }
+            }
+        }
+
+        stage('Post to Slack') {
+            environment {
+                CPPAL_SLACK_WEBHOOK = credentials('cppal_slack_webhook')
+            }
+
+            steps {
+                sh '''#!/bin/bash
+                set -x
+                . jenkinsjobinfo.sh
+                PREVIEWMESSAGE="A preview of the cppalliance website is available at https://${CHANGE_ID}.${DNSREPONAME}.prtest.cppalliance.org"
+                PREVIEWDATA="{\\"text\\":\\"$PREVIEWMESSAGE\\"}"
+                curl -X POST -H 'Content-type: application/json' --data "$PREVIEWDATA" ${CPPAL_SLACK_WEBHOOK}
+                '''
+             }
+        }
+
+        stage('Post Diagnostics') {
+            steps {
+                sh '''#!/bin/bash
+                set -x
+                # not set -e. errors may occur in diagnostics
+                cat jenkinsjobinfo.sh
+                . jenkinsjobinfo.sh
+                ls -al
+                cat /etc/os-release
+                pwd
+                env
+                whoami
+                touch $(date "+%A-%B-%d-%T-%y")
+                mount | grep ^/dev/ | grep -v /etc | awk '{print \$3}'
+                git branch
+                git branch -avv
+                true
+                '''
+            }
+        }
+
+    }
+
+    post {
+            always {
+                echo 'This will always run'
+            }
+            success {
+                echo 'This will run only if successful'
+                // no email on success
+                // mail bcc: '', body: "<b>Example</b><br>Project: ${env.JOB_NAME} <br>Build Number: ${env.BUILD_NUMBER} <br> URL of the build: ${env.BUILD_URL}", cc: '', charset: 'UTF-8', from: '', mimeType: 'text/html', replyTo: '', subject: "SUCCESS CI: Project name -> ${env.JOB_NAME}", to: "jenkins@cppalliance.org";
+            }
+            failure {
+                echo 'This will run only if failure'
+                mail bcc: '', body: "<b>Example</b><br>Project: ${env.JOB_NAME} <br>Build Number: ${env.BUILD_NUMBER} <br> URL of the build: ${env.BUILD_URL}", cc: '', charset: 'UTF-8', from: '', mimeType: 'text/html', replyTo: '', subject: "ERROR CI: Project name -> ${env.JOB_NAME}", to: "jenkins@cppalliance.org";
+            }
+            unstable {
+                echo 'This will run only if the run was marked as unstable'
+                mail bcc: '', body: "<b>Example</b><br>Project: ${env.JOB_NAME} <br>Build Number: ${env.BUILD_NUMBER} <br> URL of the build: ${env.BUILD_URL}", cc: '', charset: 'UTF-8', from: '', mimeType: 'text/html', replyTo: '', subject: "UNSTABLE STATUS CI: Project name -> ${env.JOB_NAME}", to: "jenkins@cppalliance.org";
+            }
+            changed {
+                echo 'This will run only if the state of the Pipeline has changed'
+                echo 'For example, if the Pipeline was previously failing but is now successful'
+                // no email on changed status
+                // mail bcc: '', body: "<b>Example</b><br>Project: ${env.JOB_NAME} <br>Build Number: ${env.BUILD_NUMBER} <br> URL of the build: ${env.BUILD_URL}", cc: '', charset: 'UTF-8', from: '', mimeType: 'text/html', replyTo: '', subject: "CHANGED STATUS CI: Project name -> ${env.JOB_NAME}", to: "jenkins@cppalliance.org";
+            }
+      }
+
+}
