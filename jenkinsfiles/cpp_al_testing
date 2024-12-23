@@ -199,7 +199,7 @@ pipeline {
 
         stage('Post to Slack') {
             environment {
-                CPPAL_SLACK_WEBHOOK = credentials('cppal_slack_webhook')
+                CPPAL_SLACK_WEBHOOK = credentials('cppal_slack_webhook_testing')
             }
 
             steps {
