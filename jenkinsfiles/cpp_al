@@ -36,10 +36,10 @@ pipeline {
                 # REPONAME=$(basename `git rev-parse --show-toplevel`)
                 DNSREPONAME=$(echo $REPONAME | tr '_' '-')
                 ORGANIZATION=$(basename $(dirname "${GIT_URL}"))
-                if [[ "${GIT_URL}" =~ sdarwin || "${GIT_URL}" =~ openshift ]]; then
+                if [[ "${GIT_URL}" =~ openshift ]]; then
                     # testing environment
-                    echo "export JENKINS_CI_REPO=sdarwin/jenkins-ci" >> jenkinsjobinfo.sh
-                    echo "export JENKINS_CI_REPO_BRANCH=testing" >> jenkinsjobinfo.sh
+                    echo "export JENKINS_CI_REPO=openshift2/jenkins-ci-variation-testing" >> jenkinsjobinfo.sh
+                    echo "export JENKINS_CI_REPO_BRANCH=master" >> jenkinsjobinfo.sh
                 else
                     # standard
                     echo "export JENKINS_CI_REPO=cppalliance/jenkins-ci" >> jenkinsjobinfo.sh
